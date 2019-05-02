@@ -1,0 +1,11 @@
+env/
+temp/
+venv/
+.idea/
+*.pyc
+__pycache__
+.aws-sam/
+gitlab_to_codecommit_migration.egg-info/
+dist/
+build/
+code-environment-setup.yaml-packaged.yaml

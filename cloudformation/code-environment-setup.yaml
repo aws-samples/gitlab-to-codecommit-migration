@@ -1,0 +1,286 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  HTTPWebHookParam:
+    Type: String
+    Description: Chime Webhook to post messages to (when empty, no notifications are send out)
+    Default: ""
+  BuildComputeType:
+    Type: String
+    Description: Instance Type to use for build
+    Default: BUILD_GENERAL1_SMALL
+  BuildImage:
+    Type: String
+    Description: Docker image to use for build
+    Default: "aws/codebuild/python:3.7.1"
+
+Conditions:
+  UseChime: !Not [!Equals [!Ref HTTPWebHookParam, ""]]
+
+###########
+# RESOURCES
+###########
+Resources:
+  ##########
+  # ROLES
+  ##########
+
+  BuildAndDeployPipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+      Path: /
+      Policies:
+        - PolicyName: CodePipelineAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - 's3:*'
+                  - 'iam:PassRole'
+                  - 'iam:AssumeRole'
+                  - 'sns:Publish'
+                  - 'lambda:InvokeFunction'
+                  - 'lambda:ListFunctions'
+                  - 'codecommit:*'
+                  - 'codebuild:*'
+                Effect: Allow
+                Resource: '*'
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "codebuild.amazonaws.com"
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: code-build-service-role
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "s3:PutObject"
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                Resource:
+                  - !ImportValue CodeArtifactsBucketArn
+                  - Fn::Sub:
+                    - "${CodeArtifactsBucketArnValue}/*"
+                    - CodeArtifactsBucketArnValue: !ImportValue CodeArtifactsBucketArn
+
+  RoleEventsStartPipeline:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: cwe-pipeline-execution
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:*"
+
+
+  ########
+  # LAMBDA
+  ########
+
+  ChimeNotifications:
+    Type: AWS::Serverless::Function
+    Condition: UseChime
+    Properties:
+      Handler: code_commit_lambda.lambda_handler
+      Runtime: python3.6
+      CodeUri: "../chime_notifications/"
+      Timeout: 100
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+          HTTP_ENDPOINT: !Ref HTTPWebHookParam
+      Policies:
+        - AWSCodeCommitReadOnly
+      Events:
+        PullRequestOrComment:
+          Type: CloudWatchEvent
+          Properties:
+            Pattern:
+              source:
+                - aws.codecommit
+              detail-type:
+                - 'CodeCommit Pull Request State Change'
+                - 'CodeCommit Comment on Pull Request'
+                - 'CodeCommit Comment on Commit'
+              resources:
+                - !GetAtt CodeRepository.Arn
+        MasterMerge:
+          Type: CloudWatchEvent
+          Properties:
+            Pattern:
+              source:
+                - aws.codecommit
+              detail-type:
+                - 'CodeCommit Repository State Change'
+              resources:
+                - !GetAtt CodeRepository.Arn
+              detail:
+                event:
+                  - referenceCreated
+                  - referenceUpdated
+                referenceType:
+                  - branch
+                referenceName:
+                  - master
+        CodeBuildEvents:
+          Type: CloudWatchEvent
+          Properties:
+            Pattern:
+              source:
+                - aws.codebuild
+              detail-type:
+                - 'CodeBuild Build State Change'
+              detail:
+                build-status:
+                  - "IN_PROGRESS"
+                  - "SUCCEEDED"
+                  - "FAILED"
+                  - "STOPPED"
+                project-name:
+                  - !Ref CodeBuildAndDeploy
+
+
+
+  ###########################################
+  # CODE COMMIT, CODE BUILD and CODE PIPELINE
+  ###########################################
+  CodeRepository:
+    Type: AWS::CodeCommit::Repository
+    DeletionPolicy: Retain
+    Properties:
+      RepositoryName: !Ref AWS::StackName
+
+  CodeBuildAndDeploy:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AWS::StackName}"
+      Artifacts:
+        Type: CODEPIPELINE
+      BadgeEnabled: False
+      Description: Build and Deploy the CFN
+      Environment:
+        ComputeType: !Ref BuildComputeType
+        Image: !Ref BuildImage
+        ImagePullCredentialsType: CODEBUILD
+        PrivilegedMode: True
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: ARTIFACTS_BUCKET
+            Value: !ImportValue CodeArtifactsBucket
+            Type: PLAINTEXT
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Source:
+        Type: CODEPIPELINE
+
+
+  BuildAndDeployPipeline:
+    Type: "AWS::CodePipeline::Pipeline"
+    Properties:
+      ArtifactStore:
+        Location: !ImportValue CodeArtifactsBucket
+        Type: S3
+      RestartExecutionOnUpdate: True
+      RoleArn: !GetAtt BuildAndDeployPipelineRole.Arn
+      Stages:
+        - Name: PullSource
+          Actions:
+            - Name: PullSource
+              OutputArtifacts:
+                - Name: "PullFromSourceBranch-master"
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: 1
+              Configuration:
+                BranchName: master
+                RepositoryName: !GetAtt CodeRepository.Name
+                PollForSourceChanges: false
+        - Name: CodeBuildAndDeployStage
+          Actions:
+            - Name: BuildAndDeploy
+              InputArtifacts:
+                - Name: "PullFromSourceBranch-master"
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              Configuration:
+                ProjectName: !Ref CodeBuildAndDeploy
+
+  EventRepoChangeOnMaster:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - 'CodeCommit Repository State Change'
+        resources:
+          - !GetAtt CodeRepository.Arn
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName:
+            - master
+      Targets:
+        - Arn:
+            !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${BuildAndDeployPipeline}"
+          RoleArn: !GetAtt RoleEventsStartPipeline.Arn
+          Id: !Sub "${AWS::StackName}-EventRepoChangeOnMaster"
+
+#########
+# OUTPUTS
+#########
+Outputs:
+  CodeRepoSSH:
+    Description: Code Repo Clone SSH
+    Value: !GetAtt CodeRepository.CloneUrlSsh
+
+  CodeRepoHTTP:
+    Description: Code Repo Clone HTTP
+    Value: !GetAtt CodeRepository.CloneUrlHttp

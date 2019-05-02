@@ -1,0 +1,36 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Basic account setup
+
+###########
+# RESOURCES
+###########
+Resources:
+  ####
+  # S3
+  ####
+  CodeArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "code-artifacts-${AWS::AccountId}-${AWS::Region}"
+      AccessControl: "BucketOwnerFullControl"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - NoncurrentVersionExpirationInDays: 90
+            Status: Enabled
+
+#########
+# OUTPUTS
+#########
+Outputs:
+  CodeArtifactsBucket:
+    Description: Code artifacts bucket for deployment
+    Value: !Ref CodeArtifactsBucket
+    Export:
+      Name: CodeArtifactsBucket
+  CodeArtifactsBucketArn:
+    Description: Code artifacts bucket ARN for deployment
+    Value: !GetAtt CodeArtifactsBucket.Arn
+    Export:
+      Name: CodeArtifactsBucketArn

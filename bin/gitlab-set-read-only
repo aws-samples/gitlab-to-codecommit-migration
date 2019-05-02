@@ -1,0 +1,108 @@
+#!/usr/bin/env python
+
+import requests
+import argparse
+import logging
+import sys
+import urllib.parse
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--gitlab-access-token', required=True)
+parser.add_argument('--gitlab-url', required=True)
+
+group_projects = parser.add_mutually_exclusive_group(required=True)
+group_projects.add_argument('--repository-names', nargs='+',
+                            help='names fo repositories in the form of "namespace/repository-name')
+group_projects.add_argument('--all', help='mirror all repositories', action='store_true')
+group_projects.add_argument('--users', nargs='+', help='mirror all repositories for the users')
+group_projects.add_argument('--groups', nargs='+', help='mirror all repositories for the groups')
+
+args = parser.parse_args()
+
+gitlab_url = args.gitlab_url
+gitlab_access_token = args.gitlab_access_token
+gitlab_api = f'{gitlab_url}/api/v4'
+gitlab_project_url = f'{gitlab_api}/projects'
+gitlab_project_by_groups = f'{gitlab_api}/groups'
+gitlab_project_by_users = f'{gitlab_api}/users'
+projects_all = args.all
+projects_users = args.users
+projects_groups = args.groups
+
+
+headers = {
+    'Private-Token': gitlab_access_token,
+    'cache-control': "no-cache"
+}
+
+read_only_branches_param = {'name': '*', 'push_access_level': 0, 'merge_access_level': 0, 'unprotect_access_level': 0}
+
+projects = []
+
+if projects_all:
+    logger.info(f'get_projects_url: {gitlab_project_url}')
+    r = requests.request("GET", gitlab_project_url, data='', headers=headers)
+    projects.extend(r.json())
+
+    while r.links and r.links.get('next') and r.links.get('next').get('url'):
+        r = requests.request("GET", r.links.get('next').get('url'), data='', headers=headers)
+        projects.extend(r.json())
+
+    logger.info(f'found {len(projects)} projects in GitLab')
+elif projects_users:
+    for user in projects_users:
+        r = requests.request("GET", f'{gitlab_project_by_users}/{user}/projects', data='', headers=headers)
+        projects.extend(r.json())
+
+        while r.links and r.links.get('next') and r.links.get('next').get('url'):
+            r = requests.request("GET", r.links.get('next').get('url'), data='', headers=headers)
+            projects.extend(r.json())
+
+        logger.info(f'found {len(projects)} projects in GitLab for user: {user}')
+    if len(projects_users) > 1:
+        logger.info(f'found total number of {len(projects)} projects in GitLab for users: {projects_users}')
+elif projects_groups:
+    for group in projects_groups:
+        r = requests.request("GET", f'{gitlab_project_by_groups}/{group}/projects', data='', headers=headers)
+        projects.extend(r.json())
+        while r.links and r.links.get('next') and r.links.get('next').get('url'):
+            r = requests.request("GET", r.links.get('next').get('url'), data='', headers=headers)
+            projects.extend(r.json())
+        logger.info(f'found {len(projects)} projects in GitLab for group: {group}')
+    if len(projects_groups) > 1:
+        logger.info(f'found total number of {len(projects)} projects in GitLab for groups: {projects_groups}')
+else:
+    for path_with_namespace in args.repository_names:
+        urlencode_project = f'{gitlab_project_url}/{urllib.parse.quote(path_with_namespace, safe="")}'
+        logger.info(f'project: {urlencode_project}')
+        r = requests.request("GET",
+                             urlencode_project,
+                             data='',
+                             headers=headers)
+        projects.append(r.json())
+
+
+for p in projects:
+    project_id = p['id']
+    logger.info(f'project_id: {project_id}')
+    gitlab_protected_branches = f'{gitlab_project_url}/{project_id}/protected_branches'
+    protected_branches_r = requests.get(gitlab_protected_branches, headers=headers)
+    if protected_branches_r:
+        for branch in protected_branches_r.json():
+            del_r = requests.delete(f'{gitlab_protected_branches}/{branch.get("name")}', headers=headers)
+            if del_r:
+                logger.info(f'delete current protected branches for project_id: {project_id}')
+            else:
+                logger.warning(f'delete returned {del_r.status_code} instead of 200-400 '
+                               f'for project_id: {project_id}. {del_r.reason}')
+        post_r = requests.post(f'{gitlab_protected_branches}', params=read_only_branches_param, headers=headers)
+        if post_r.status_code:
+            logger.info(f'created read-only for project_id: {project_id}')
+        else:
+            logger.error(f'did not create the *:no_one protected branch for project_id: {project_id}')
+
+    else:
+        logger.info(f'no 200-400 on project_id: {project_id}, got response: {protected_branches_r}')
